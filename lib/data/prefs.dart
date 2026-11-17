@@ -375,6 +375,44 @@ class Stows {
     volatile: !_isOnMainIsolate,
   );
 
+  /// Whether Google Drive sync is switched on (signed in).
+  final gdriveEnabled = PlainStow(
+    'gdriveEnabled',
+    false,
+    volatile: !_isOnMainIsolate,
+  );
+
+  /// The Google account used for Drive sync, shown in settings.
+  final gdriveEmail = PlainStow('gdriveEmail', '', volatile: !_isOnMainIsolate);
+
+  /// Drive ID of the folder holding the synced Saber files.
+  final gdriveSyncFolderId = PlainStow(
+    'gdriveSyncFolderId',
+    '',
+    volatile: !_isOnMainIsolate,
+  );
+
+  /// Drive ID of the folder holding the PDF copies of notes.
+  final gdrivePdfFolderId = PlainStow(
+    'gdrivePdfFolderId',
+    '',
+    volatile: !_isOnMainIsolate,
+  );
+
+  /// Whether to keep a PDF copy of every note on Drive.
+  final gdriveExportPdfs = PlainStow(
+    'gdriveExportPdfs',
+    true,
+    volatile: !_isOnMainIsolate,
+  );
+
+  /// Notes (paths without extension) whose PDF still needs updating.
+  final gdrivePdfPending = PlainStow(
+    'gdrivePdfPending',
+    <String>{},
+    volatile: !_isOnMainIsolate,
+  );
+
   /// The last storage quota that was fetched from Nextcloud
   final lastStorageQuota = PlainStow<Quota?>(
     'lastStorageQuota',

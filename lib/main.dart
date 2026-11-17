@@ -18,6 +18,7 @@ import 'package:saber/components/canvas/pencil_shader.dart';
 import 'package:saber/components/theming/dynamic_material_app.dart';
 import 'package:saber/data/file_manager/file_manager.dart';
 import 'package:saber/data/flavor_config.dart';
+import 'package:saber/data/gdrive/drive_syncer.dart';
 import 'package:saber/data/nextcloud/nc_http_overrides.dart';
 import 'package:saber/data/nextcloud/saber_syncer.dart';
 import 'package:saber/data/prefs.dart';
@@ -124,6 +125,7 @@ Future<void> appRunner(List<String> args) async {
   HttpOverrides.global = NcHttpOverrides();
   runApp(SentryWidget(child: TranslationProvider(child: const App())));
   startSyncAfterLoaded();
+  unawaited(DriveSync.start());
   setupBackgroundSync();
 }
 

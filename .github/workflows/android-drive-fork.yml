@@ -1,0 +1,105 @@
+name: Build Saber Drive (Android)
+
+# Builds the Google Drive fork as a signed APK.
+#
+# Repository settings needed (Settings > Secrets and variables > Actions):
+#   Variable  GOOGLE_SERVER_CLIENT_ID  Web OAuth client ID from Google Cloud
+#   Secrets   SIGNING_KEY              base64 of your release keystore (.jks)
+#             KEY_STORE_PASSWORD, KEY_PASSWORD, ALIAS
+# Without the signing secrets the repo's public fallback key is used,
+# which works for testing but should not be used day to day.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - gdrive-sync
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: "./.github/shared_workflows/install_apt_dependencies"
+
+      - name: Setup Flutter
+        uses: adil192/setup-flutter-submodule@v3
+        with:
+          flutter-path: submodules/flutter
+          no-save-caches: true
+
+      - name: Setup keystore
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: ${{ env.SIGNING_KEY != '' }}
+        run: |
+          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > android/android.keystore
+          echo "storePassword=${{ secrets.KEY_STORE_PASSWORD }}" > android/key.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/key.properties
+          echo "keyAlias=${{ secrets.ALIAS }}" >> android/key.properties
+          echo "storeFile=../android.keystore" >> android/key.properties
+
+      - name: Setup Android build tools
+        run: |
+          ANDROID_NDK=/usr/local/lib/android/sdk/ndk/29.0.14206865
+          echo "ANDROID_NDK=$ANDROID_NDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK" >> $GITHUB_ENV
+
+          echo "JAVA_HOME=$JAVA_HOME_25_X64" >> $GITHUB_ENV
+
+      - name: Disable Flutter CLI animations
+        run: flutter config --no-cli-animations
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Analyze Drive sync code
+        run: |
+          flutter analyze --no-fatal-infos \
+            lib/data/gdrive \
+            lib/components/settings/google_drive_settings.dart \
+            lib/data/file_manager/file_manager.dart \
+            lib/data/editor/editor_exporter.dart \
+            lib/data/prefs.dart \
+            lib/main.dart \
+            lib/pages/home/settings.dart
+
+      - name: Run Drive sync tests
+        run: flutter test test/gdrive_test.dart
+
+      - name: Build apk
+        env:
+          GOOGLE_SERVER_CLIENT_ID: ${{ vars.GOOGLE_SERVER_CLIENT_ID }}
+        run: |
+          if [ -z "$GOOGLE_SERVER_CLIENT_ID" ]; then
+            echo "::warning::GOOGLE_SERVER_CLIENT_ID is not set, Google sign-in will fail"
+          fi
+          flutter build apk \
+            --dart-define=GOOGLE_SERVER_CLIENT_ID="$GOOGLE_SERVER_CLIENT_ID" \
+            --dart-define=UPDATE_CHECK="false"
+
+      - name: Print signing certificate SHA-1
+        run: |
+          keytool -printcert -jarfile build/app/outputs/flutter-apk/app-release.apk | grep -E "SHA1|SHA-1|SHA256" || true
+
+      - name: Rename apk
+        id: rename_apk
+        run: |
+          buildName=$(grep -oP "(?<=buildName = ').*(?=')" lib/data/version.dart)
+          apkName="SaberDrive_v${buildName}.apk"
+          echo "apkName=$apkName" >> $GITHUB_OUTPUT
+          mkdir -p output
+          mv build/app/outputs/flutter-apk/app-release.apk output/$apkName
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Saber-Drive-Android
+          path: output/${{ steps.rename_apk.outputs.apkName }}

@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:saber/components/navbar/responsive_navbar.dart';
 import 'package:saber/components/settings/app_info.dart';
+import 'package:saber/components/settings/google_drive_settings.dart';
 import 'package:saber/components/settings/nextcloud_profile.dart';
 import 'package:saber/components/settings/settings_button.dart';
 import 'package:saber/components/settings/settings_color.dart';
@@ -190,6 +191,7 @@ class _SettingsPageState extends State<SettingsPage> {
             sliver: SliverList.list(
               children: [
                 const NextcloudProfile(),
+                const GoogleDriveSettings(),
                 const Padding(padding: .all(8), child: AppInfo()),
                 SettingsSubtitle(subtitle: t.settings.prefCategories.general),
                 SettingsDropdown(
