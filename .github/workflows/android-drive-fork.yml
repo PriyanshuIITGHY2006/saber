@@ -76,7 +76,7 @@ jobs:
 
       - name: Build apk
         env:
-          GOOGLE_SERVER_CLIENT_ID: ${{ vars.GOOGLE_SERVER_CLIENT_ID }}
+          GOOGLE_SERVER_CLIENT_ID: ${{ vars.GOOGLE_SERVER_CLIENT_ID || '743187611906-vtbu5giuppfsf2pk4a1irgo0bdits0uc.apps.googleusercontent.com' }}
         run: |
           if [ -z "$GOOGLE_SERVER_CLIENT_ID" ]; then
             echo "::warning::GOOGLE_SERVER_CLIENT_ID is not set, Google sign-in will fail"
@@ -87,7 +87,8 @@ jobs:
 
       - name: Print signing certificate SHA-1
         run: |
-          keytool -printcert -jarfile build/app/outputs/flutter-apk/app-release.apk | grep -E "SHA1|SHA-1|SHA256" || true
+          APKSIGNER=$(ls /usr/local/lib/android/sdk/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk | grep -E "SHA-1|SHA-256" || true
 
       - name: Rename apk
         id: rename_apk
