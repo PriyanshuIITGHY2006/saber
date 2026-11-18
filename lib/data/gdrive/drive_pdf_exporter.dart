@@ -95,8 +95,7 @@ abstract final class DrivePdfExporter {
     final coreInfo = await EditorCoreInfo.loadFromFilePath(notePath);
     if (coreInfo.pages.isEmpty) return;
 
-    final pdf = await EditorExporter.generatePdf(coreInfo);
-    final bytes = await pdf.save();
+    final bytes = await EditorExporter.generatePdfBytes(coreInfo);
 
     await DriveTree.uploadFile(
       DriveRoot.pdf,

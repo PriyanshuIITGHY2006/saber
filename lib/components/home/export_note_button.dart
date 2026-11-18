@@ -36,8 +36,10 @@ class _ExportNoteButtonState extends State<ExportNoteButton> {
       );
 
       if (exportPdf) {
-        final pdfDoc = await EditorExporter.generatePdf(coreInfo, context);
-        final pdfBytes = await pdfDoc.save();
+        final pdfBytes = await EditorExporter.generatePdfBytes(
+          coreInfo,
+          context,
+        );
         files.add(
           ArchiveFile(
             '$fileNameWithoutExtension.pdf',

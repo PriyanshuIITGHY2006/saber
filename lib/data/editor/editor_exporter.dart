@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter_quill/flutter_quill.dart';
 import 'package:image/image.dart' as im;
+import 'package:logging/logging.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -14,7 +16,10 @@ import 'package:saber/components/canvas/_stroke.dart';
 import 'package:saber/components/canvas/canvas_preview.dart';
 import 'package:saber/components/canvas/inner_canvas.dart';
 import 'package:saber/data/editor/editor_core_info.dart';
+import 'package:saber/data/editor/page.dart';
+import 'package:saber/data/editor/vector_pdf_exporter.dart';
 import 'package:saber/data/is_this_a_test.dart';
+import 'package:sbn/canvas_background_pattern.dart';
 import 'package:screenshot/screenshot.dart';
 
 abstract class EditorExporter {
@@ -26,6 +31,33 @@ abstract class EditorExporter {
   /// - Pencil strokes, which need a special shader to look correct
   static bool shouldRasterizeStroke(Stroke stroke) {
     return stroke.toolId == .highlighter || stroke.toolId == .pencil;
+  }
+
+  static final log = Logger('EditorExporter');
+
+  /// Exports [coreInfo] as PDF bytes.
+  ///
+  /// Notes built on imported PDFs keep the original PDF pages (with their
+  /// text and vector graphics) and only add the user's writing on top,
+  /// see [VectorPdfExporter]. Everything else, and any note where that
+  /// fails, uses [generatePdf].
+  static Future<Uint8List> generatePdfBytes(
+    EditorCoreInfo coreInfo, [
+    BuildContext? context,
+  ]) async {
+    if (VectorPdfExporter.canExport(coreInfo)) {
+      try {
+        return await VectorPdfExporter.export(coreInfo);
+      } catch (e, st) {
+        log.warning(
+          'Vector PDF export failed, falling back to rasterized export: $e',
+          e,
+          st,
+        );
+      }
+    }
+    final pdf = await generatePdf(coreInfo, context);
+    return pdf.save();
   }
 
   static Future<pw.Document> generatePdf(
@@ -86,53 +118,12 @@ abstract class EditorExporter {
                     coreInfo.backgroundColor?.toARGB32() ??
                         InnerCanvas.defaultBackgroundColor.toARGB32(),
                   ).flatten();
-
-                  final strokes = page.strokes.where(
-                    (stroke) => !shouldRasterizeStroke(stroke),
+                  drawVectorStrokes(
+                    pdfGraphics,
+                    strokes: page.strokes,
+                    pageHeight: pageSize.height,
+                    backgroundColor: backgroundColor,
                   );
-                  for (final stroke in strokes) {
-                    final strokeColor = PdfColor.fromInt(
-                      stroke.color.toARGB32(),
-                    ).flatten(background: backgroundColor);
-
-                    /// Whether we need to fill the shape, or draw its stroke
-                    final bool shouldFillShape;
-                    if (stroke is CircleStroke) {
-                      shouldFillShape = false;
-                      pdfGraphics.drawEllipse(
-                        stroke.center.dx,
-                        pageSize.height - stroke.center.dy,
-                        stroke.radius,
-                        stroke.radius,
-                        clockwise: false,
-                      );
-                    } else if (stroke is RectangleStroke) {
-                      shouldFillShape = false;
-                      final strokeSize = stroke.options.size;
-                      pdfGraphics.drawRRect(
-                        stroke.rect.left,
-                        pageSize.height - stroke.rect.bottom,
-                        stroke.rect.width,
-                        stroke.rect.height,
-                        strokeSize / 4,
-                        strokeSize / 4,
-                      );
-                    } else {
-                      shouldFillShape = true;
-                      pdfGraphics.drawShape(stroke.toSvgPath());
-                    }
-
-                    if (shouldFillShape) {
-                      // fill
-                      pdfGraphics.setFillColor(strokeColor);
-                      pdfGraphics.fillPath();
-                    } else {
-                      // stroke
-                      pdfGraphics.setStrokeColor(strokeColor);
-                      pdfGraphics.setLineWidth(stroke.options.size);
-                      pdfGraphics.strokePath();
-                    }
-                  }
                 },
                 child: pw.Image(
                   pw.ImageImage(pageScreenshots[pageIndex]),
@@ -149,6 +140,64 @@ abstract class EditorExporter {
     return pdf;
   }
 
+  /// Draws every stroke that doesn't need rasterizing (see
+  /// [shouldRasterizeStroke]) as vector graphics.
+  ///
+  /// Stroke colors are flattened onto [backgroundColor] because
+  /// the strokes are drawn fully opaque.
+  static void drawVectorStrokes(
+    PdfGraphics pdfGraphics, {
+    required Iterable<Stroke> strokes,
+    required double pageHeight,
+    required PdfColor backgroundColor,
+  }) {
+    for (final stroke in strokes) {
+      if (shouldRasterizeStroke(stroke)) continue;
+
+      final strokeColor = PdfColor.fromInt(
+        stroke.color.toARGB32(),
+      ).flatten(background: backgroundColor);
+
+      /// Whether we need to fill the shape, or draw its stroke
+      final bool shouldFillShape;
+      if (stroke is CircleStroke) {
+        shouldFillShape = false;
+        pdfGraphics.drawEllipse(
+          stroke.center.dx,
+          pageHeight - stroke.center.dy,
+          stroke.radius,
+          stroke.radius,
+          clockwise: false,
+        );
+      } else if (stroke is RectangleStroke) {
+        shouldFillShape = false;
+        final strokeSize = stroke.options.size;
+        pdfGraphics.drawRRect(
+          stroke.rect.left,
+          pageHeight - stroke.rect.bottom,
+          stroke.rect.width,
+          stroke.rect.height,
+          strokeSize / 4,
+          strokeSize / 4,
+        );
+      } else {
+        shouldFillShape = true;
+        pdfGraphics.drawShape(stroke.toSvgPath());
+      }
+
+      if (shouldFillShape) {
+        // fill
+        pdfGraphics.setFillColor(strokeColor);
+        pdfGraphics.fillPath();
+      } else {
+        // stroke
+        pdfGraphics.setStrokeColor(strokeColor);
+        pdfGraphics.setLineWidth(stroke.options.size);
+        pdfGraphics.strokePath();
+      }
+    }
+  }
+
   /// Returns a screenshot of the page at [pageIndex] in [coreInfo].
   ///
   /// Note that screenshots do not include most* strokes
@@ -156,18 +205,31 @@ abstract class EditorExporter {
   /// See [shouldRasterizeStroke] for more details, or set
   /// [rasterizeAllStrokes] to true to include all strokes in the screenshot.
   ///
+  /// If [transparentBackground] is true, the page's background image,
+  /// background color and background pattern are left out, so the
+  /// screenshot can be layered on top of the original background.
+  ///
   /// You must dispose this image when you're done.
   static Future<ui.Image> screenshotPage({
     required EditorCoreInfo coreInfo,
     required int pageIndex,
     bool rasterizeAllStrokes = false,
+    bool transparentBackground = false,
     Size? targetSize,
     double? cropHeight,
     double pixelRatio = 2,
   }) async {
-    final page = coreInfo.pages[pageIndex].cloneForRasterization(
+    var page = coreInfo.pages[pageIndex].cloneForRasterization(
       rasterizeAllStrokes: rasterizeAllStrokes,
     );
+    if (transparentBackground) {
+      page = EditorPage(
+        size: page.size,
+        strokes: page.strokes,
+        images: page.images,
+        quill: page.quill,
+      );
+    }
 
     final imagesToLoad = [
       ?page.backgroundImage,
@@ -180,6 +242,10 @@ abstract class EditorExporter {
       targetSize ??= page.size;
       coreInfo = coreInfo.copyWith(
         pages: [for (var i = 0; i < coreInfo.pages.length; ++i) page],
+        backgroundColor: transparentBackground ? const Color(0x00000000) : null,
+        backgroundPattern: transparentBackground
+            ? CanvasBackgroundPattern.none
+            : null,
       );
       return await ScreenshotController.widgetToUiImage(
         EditorExporterTheme(

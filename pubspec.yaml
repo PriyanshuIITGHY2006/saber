@@ -149,6 +149,9 @@ dependencies:
   flutter_web_auth_2: ^5.0.1
 
   pdfrx: ^2.5.0
+  # Raw PDFium access for keeping original pages in exported PDFs
+  pdfium_dart: ^0.4.2
+  ffi: ^2.1.0
   path: ^1.9.1
 
   stow: ^0.6.0

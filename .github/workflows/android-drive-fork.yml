@@ -67,12 +67,17 @@ jobs:
             lib/components/settings/google_drive_settings.dart \
             lib/data/file_manager/file_manager.dart \
             lib/data/editor/editor_exporter.dart \
+            lib/data/editor/vector_pdf_exporter.dart \
+            lib/data/editor/pdf_page_compositor.dart \
+            lib/components/home/export_note_button.dart \
+            lib/pages/editor/editor.dart \
+            test/vector_pdf_export_test.dart \
             lib/data/prefs.dart \
             lib/main.dart \
             lib/pages/home/settings.dart
 
-      - name: Run Drive sync tests
-        run: flutter test test/gdrive_test.dart
+      - name: Run Drive sync and PDF export tests
+        run: flutter test test/gdrive_test.dart test/vector_pdf_export_test.dart
 
       - name: Build apk
         env:
