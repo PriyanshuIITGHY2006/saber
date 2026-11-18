@@ -1,12 +1,16 @@
+import 'dart:ffi' hide Size;
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:ui' show Size;
+import 'dart:ui' show Rect, Size;
 
+import 'package:ffi/ffi.dart';
+import 'package:flutter/painting.dart' show MemoryImage;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdf/pdf.dart' as pdfw;
 // ignore: implementation_imports
 import 'package:pdf/src/pdf/format/array.dart' as pdfw_format;
+import 'package:pdfium_dart/pdfium_dart.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:saber/components/canvas/image/editor_image.dart';
 import 'package:saber/data/editor/editor_core_info.dart';
@@ -14,7 +18,9 @@ import 'package:saber/data/editor/pdf_page_compositor.dart';
 import 'package:saber/data/editor/vector_pdf_exporter.dart';
 import 'package:saber/data/file_manager/file_manager.dart';
 import 'package:saber/data/flavor_config.dart';
+import 'package:saber/data/prefs.dart';
 import 'package:saber/data/tools/stroke_properties.dart';
+import 'package:sbn/tool_id.dart';
 
 import 'utils/test_mock_channel_handlers.dart';
 
@@ -289,22 +295,44 @@ void main() {
       );
     });
 
-    testWidgets('VectorPdfExporter exports a note on a PDF', (tester) async {
+    testWidgets('VectorPdfExporter draws everything as vectors', (
+      tester,
+    ) async {
       BackgroundIsolateBinaryMessenger.ensureInitialized(
         ServicesBinding.rootIsolateToken!,
       );
       StrokeOptionsExtension.setDefaults();
       FileManager.shouldUseRawFilePath = true;
       EditorImage.shouldLoadOutImmediately = true;
+      stows.printPageIndicators.value = true;
+      addTearDown(() => stows.printPageIndicators.value = false);
 
       const path = 'test/sbn_examples/v18_highlighter';
-      final result = await tester.runAsync(() async {
+      final pngBytes = File(
+        'test/sbn_examples/v19_separate_assets.sbn2.0',
+      ).readAsBytesSync();
+
+      final (result, highlightAt) = (await tester.runAsync(() async {
         final coreInfo = await EditorCoreInfo.loadFromFileContents(
           bsonBytes: File('$path.sbn2').readAsBytesSync(),
           path: path,
           onlyFirstPage: true,
         );
         final page = coreInfo.pages.first;
+        expect(
+          page.quill.controller.document.isEmpty(),
+          isTrue,
+          reason: 'test note should have no typed text',
+        );
+        expect(page.strokes.any((s) => s.toolId == ToolId.pencil), isFalse);
+        final highlight = page.strokes.firstWhere(
+          (s) => s.toolId == ToolId.highlighter,
+        );
+        final mid = highlight.points[highlight.points.length ~/ 2];
+        final highlightAt = (
+          mid.x / page.size.width,
+          mid.y / page.size.height,
+        );
 
         final doc = pdfw.PdfDocument();
         final pdfPage = pdfw.PdfPage(
@@ -335,22 +363,118 @@ void main() {
           onMiscChange: null,
           naturalSize: page.size,
         );
+        page.images.add(
+          PngEditorImage(
+            id: 9998,
+            assetCache: coreInfo.assetCache,
+            extension: '.png',
+            imageProvider: MemoryImage(pngBytes),
+            pageIndex: 0,
+            pageSize: page.size,
+            onMoveImage: null,
+            onDeleteImage: null,
+            onMiscChange: null,
+            dstRect: const Rect.fromLTWH(100, 300, 400, 225),
+            naturalSize: const Size(1000, 562),
+          ),
+        );
 
         expect(VectorPdfExporter.canExport(coreInfo), isTrue);
-        return VectorPdfExporter.export(coreInfo);
-      });
+        return (await VectorPdfExporter.export(coreInfo), highlightAt);
+      }))!;
 
-      expect(result, isNotNull);
-      final text = await tester.runAsync(() async {
-        final doc = await PdfDocument.openData(result!);
+      final images = await tester.runAsync(
+        () => PdfrxEntryFunctions.instance.compute(_imageSizesInWorker, result),
+      );
+      expect(
+        images,
+        [(1000, 562)],
+        reason: 'only the pasted image, no screenshot of the page',
+      );
+
+      final (text, brightness, blue, red) = (await tester.runAsync(() async {
+        final doc = await PdfDocument.openData(result);
         try {
           expect(doc.pages.length, 1);
-          return (await doc.pages.first.loadText())?.fullText;
+          final page = doc.pages.first;
+          final text = (await page.loadText())?.fullText ?? '';
+          final image = await _render(page);
+          try {
+            final x = (highlightAt.$1 * image.width).floor();
+            final y = (highlightAt.$2 * image.height).floor();
+            final o = (y * image.width + x) * 4;
+            final p = image.pixels;
+            // BGRA
+            return (
+              text,
+              _brightnessAt(image, highlightAt.$1, highlightAt.$2),
+              p[o],
+              p[o + 2],
+            );
+          } finally {
+            image.dispose();
+          }
         } finally {
           await doc.dispose();
         }
-      });
-      expect(text, contains('Lecture slide text'));
+      }))!;
+
+      expect(text, contains('Lecture slide text'), reason: 'PDF text kept');
+      expect(text, contains('1 / 1'), reason: 'page number is real text');
+      expect(
+        brightness < 245 || (red - blue).abs() > 20,
+        isTrue,
+        reason: 'highlighter should be visible (brightness $brightness)',
+      );
     });
   });
+}
+
+/// Pixel sizes of every image in [bytes], including images inside
+/// form XObjects. Runs on pdfrx's PDFium worker.
+List<(int, int)> _imageSizesInWorker(Uint8List bytes) {
+  final pdfium = getPdfium(modulePath: Pdfrx.pdfiumModulePath);
+  final buffer = malloc<Uint8>(bytes.length);
+  buffer.asTypedList(bytes.length).setAll(0, bytes);
+  final width = malloc<UnsignedInt>();
+  final height = malloc<UnsignedInt>();
+  final doc = pdfium.FPDF_LoadMemDocument64(
+    buffer.cast(),
+    bytes.length,
+    nullptr,
+  );
+  final sizes = <(int, int)>[];
+  try {
+    void visit(FPDF_PAGEOBJECT object) {
+      final type = pdfium.FPDFPageObj_GetType(object);
+      if (type == FPDF_PAGEOBJ_IMAGE) {
+        pdfium.FPDFImageObj_GetImagePixelSize(object, width, height);
+        sizes.add((width.value, height.value));
+      } else if (type == FPDF_PAGEOBJ_FORM) {
+        final count = pdfium.FPDFFormObj_CountObjects(object);
+        for (var i = 0; i < count; i++) {
+          visit(pdfium.FPDFFormObj_GetObject(object, i));
+        }
+      }
+    }
+
+    for (var p = 0; p < pdfium.FPDF_GetPageCount(doc); p++) {
+      final page = pdfium.FPDF_LoadPage(doc, p);
+      try {
+        final count = pdfium.FPDFPage_CountObjects(page);
+        for (var i = 0; i < count; i++) {
+          visit(pdfium.FPDFPage_GetObject(page, i));
+        }
+      } finally {
+        pdfium.FPDF_ClosePage(page);
+      }
+    }
+  } finally {
+    pdfium.FPDF_CloseDocument(doc);
+    malloc
+      ..free(buffer)
+      ..free(width)
+      ..free(height);
+  }
+  return sizes;
 }

@@ -19,6 +19,7 @@ import 'package:saber/data/editor/editor_core_info.dart';
 import 'package:saber/data/editor/page.dart';
 import 'package:saber/data/editor/vector_pdf_exporter.dart';
 import 'package:saber/data/is_this_a_test.dart';
+import 'package:saber/data/tools/highlighter.dart';
 import 'package:sbn/canvas_background_pattern.dart';
 import 'package:screenshot/screenshot.dart';
 
@@ -198,6 +199,79 @@ abstract class EditorExporter {
     }
   }
 
+  /// Draws highlighter strokes as vector graphics, the way the canvas
+  /// does: strokes of the same color (in a row) are merged into one shape,
+  /// so overlaps don't get darker, then blended with "darken" at
+  /// [Highlighter.alpha] opacity.
+  ///
+  /// Call this before [drawVectorStrokes]: the canvas draws highlighter
+  /// strokes underneath all other strokes.
+  static void drawHighlighterStrokes(
+    PdfGraphics pdfGraphics, {
+    required Iterable<Stroke> strokes,
+    required double pageHeight,
+  }) {
+    final highlights = strokes
+        .where((stroke) => stroke.toolId == .highlighter)
+        .toList(growable: false);
+    var start = 0;
+    while (start < highlights.length) {
+      final color = highlights[start].color.withValues(alpha: 1).toARGB32();
+      var end = start + 1;
+      while (end < highlights.length &&
+          highlights[end].color.withValues(alpha: 1).toARGB32() == color) {
+        end++;
+      }
+
+      final path = StringBuffer();
+      for (final stroke in highlights.sublist(start, end)) {
+        _appendNormalizedPolygon(path, stroke.highQualityPolygon, pageHeight);
+      }
+      if (path.isNotEmpty) {
+        pdfGraphics
+          ..saveContext()
+          ..setGraphicState(
+            PdfGraphicState(
+              opacity: Highlighter.alpha / 255,
+              blendMode: PdfBlendMode.darken,
+            ),
+          )
+          ..setFillColor(PdfColor.fromInt(color))
+          ..drawShape(path.toString())
+          ..fillPath()
+          ..restoreContext();
+      }
+      start = end;
+    }
+  }
+
+  /// Appends [polygon] to [path] as a closed SVG subpath, wound
+  /// counter-clockwise, so that a non-zero fill of several polygons
+  /// covers their union.
+  static void _appendNormalizedPolygon(
+    StringBuffer path,
+    List<Offset> polygon,
+    double pageHeight,
+  ) {
+    final points = polygon.where((point) => point.isFinite).toList();
+    if (points.length < 3) return;
+
+    var doubleArea = 0.0;
+    for (var i = 0; i < points.length; i++) {
+      final a = points[i];
+      final b = points[(i + 1) % points.length];
+      doubleArea += a.dx * b.dy - b.dx * a.dy;
+    }
+    final ordered = doubleArea < 0 ? points.reversed.toList() : points;
+
+    path.write('M');
+    path.writeAll(
+      ordered.map((point) => '${point.dx} ${pageHeight - point.dy}'),
+      'L',
+    );
+    path.write('Z');
+  }
+
   /// Returns a screenshot of the page at [pageIndex] in [coreInfo].
   ///
   /// Note that screenshots do not include most* strokes
@@ -209,12 +283,16 @@ abstract class EditorExporter {
   /// background color and background pattern are left out, so the
   /// screenshot can be layered on top of the original background.
   ///
+  /// If [strokeFilter] is given, only the strokes it accepts (out of the
+  /// ones that would otherwise be included) are drawn.
+  ///
   /// You must dispose this image when you're done.
   static Future<ui.Image> screenshotPage({
     required EditorCoreInfo coreInfo,
     required int pageIndex,
     bool rasterizeAllStrokes = false,
     bool transparentBackground = false,
+    bool Function(Stroke stroke)? strokeFilter,
     Size? targetSize,
     double? cropHeight,
     double pixelRatio = 2,
@@ -222,12 +300,15 @@ abstract class EditorExporter {
     var page = coreInfo.pages[pageIndex].cloneForRasterization(
       rasterizeAllStrokes: rasterizeAllStrokes,
     );
-    if (transparentBackground) {
+    if (transparentBackground || strokeFilter != null) {
       page = EditorPage(
         size: page.size,
-        strokes: page.strokes,
+        strokes: strokeFilter == null
+            ? page.strokes
+            : page.strokes.where(strokeFilter).toList(),
         images: page.images,
         quill: page.quill,
+        backgroundImage: transparentBackground ? null : page.backgroundImage,
       );
     }
 

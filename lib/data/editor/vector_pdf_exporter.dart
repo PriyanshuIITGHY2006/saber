@@ -4,11 +4,13 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart' show FileImage, MemoryImage;
 import 'package:image/image.dart' as im;
 import 'package:logging/logging.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:pool/pool.dart';
+import 'package:saber/components/canvas/_stroke.dart';
 import 'package:saber/components/canvas/image/editor_image.dart';
 import 'package:saber/components/canvas/inner_canvas.dart';
 import 'package:saber/data/editor/editor_core_info.dart';
@@ -24,12 +26,17 @@ import 'package:saber/data/prefs.dart';
 /// into an image, the output keeps the PDF's text (selectable and
 /// searchable), stays sharp at any zoom, and is usually far smaller.
 ///
-/// Pen strokes are drawn as vector graphics. Things that can't be drawn
-/// as vectors (highlighter, pencil, typed text, pasted images) go into
-/// a transparent screenshot layered over the page, and pages that have
-/// none of them aren't screenshotted at all.
+/// Pen and highlighter strokes, pasted photos and page numbers are drawn
+/// as vector graphics or embedded as-is. Only typed text, pencil strokes
+/// and images that can't be embedded (SVGs, PDFs) still need a
+/// screenshot, which is transparent and layered over the original page.
+/// Pages without any of those aren't screenshotted at all.
 abstract final class VectorPdfExporter {
   static final log = Logger('VectorPdfExporter');
+
+  /// Same as the canvas' page number, see `CanvasPainter`.
+  static const double _pageIndicatorFontSize = 20;
+  static const double _pageIndicatorPadding = 5;
 
   /// Whether [coreInfo] has any page with an imported PDF as background.
   static bool canExport(EditorCoreInfo coreInfo) {
@@ -37,13 +44,53 @@ abstract final class VectorPdfExporter {
     return coreInfo.pages.any((page) => page.backgroundImage is PdfEditorImage);
   }
 
-  /// Whether [page] has content that has to be rasterized.
-  static bool _needsScreenshot(EditorPage page) {
-    // Page numbers are drawn by the canvas
-    if (stows.printPageIndicators.value) return true;
-    if (page.images.isNotEmpty) return true;
+  /// Pencil strokes use a texture shader, so they can't be drawn as
+  /// vectors. Everything else drawn by the user can.
+  static bool _isPencil(Stroke stroke) => stroke.toolId == .pencil;
+
+  /// Content on [page] that only a screenshot can reproduce.
+  static bool _hasRasterOnlyContent(EditorPage page) {
     if (!page.quill.controller.document.isEmpty()) return true;
-    return page.strokes.any(EditorExporter.shouldRasterizeStroke);
+    return page.strokes.any(_isPencil);
+  }
+
+  /// [page]'s images as embeddable PDF images, or null if any of them
+  /// can't be embedded directly (e.g. SVGs, PDFs or cropped images).
+  static Future<List<(EditorImage, pw.ImageProvider)>?> _embeddableImages(
+    EditorPage page,
+  ) async {
+    final result = <(EditorImage, pw.ImageProvider)>[];
+    for (final image in page.images) {
+      final pdfImage = await _pdfImageFor(image);
+      if (pdfImage == null) return null;
+      result.add((image, pdfImage));
+    }
+    return result;
+  }
+
+  static Future<pw.ImageProvider?> _pdfImageFor(EditorImage image) async {
+    if (image is! PngEditorImage) return null;
+    if (image.srcRect.topLeft != ui.Offset.zero) return null;
+    if (image.dstRect.width <= 0 || image.dstRect.height <= 0) return null;
+
+    final provider = image.imageProvider;
+    final Uint8List bytes;
+    if (provider is MemoryImage) {
+      bytes = provider.bytes;
+    } else if (provider is FileImage) {
+      bytes = await provider.file.readAsBytes();
+    } else {
+      return null;
+    }
+    if (bytes.isEmpty) return null;
+
+    try {
+      // Embeds the original file (e.g. a JPEG as-is), at full quality.
+      return pw.MemoryImage(bytes);
+    } catch (e) {
+      log.fine('Image ${image.id} will be rasterized instead: $e');
+      return null;
+    }
   }
 
   static Future<Uint8List> _readPdfBytes(PdfEditorImage image) async {
@@ -85,19 +132,38 @@ abstract final class VectorPdfExporter {
       sources.add(await _readPdfBytes(background));
     }
 
-    // Screenshot only the pages that need it.
+    // Decide per page what can be drawn as vectors. PDF pages are drawn
+    // entirely as vectors unless they have typed text, pencil strokes or
+    // images that can't be embedded. Plain pages still need a screenshot
+    // for their background pattern.
+    final embeddedImages = <List<(EditorImage, pw.ImageProvider)>?>[];
+    final needsScreenshot = <bool>[];
+    for (var i = 0; i < pages.length; i++) {
+      final page = pages[i];
+      if (pdfBackgrounds[i] == null) {
+        embeddedImages.add(null);
+        needsScreenshot.add(true);
+      } else if (_hasRasterOnlyContent(page)) {
+        embeddedImages.add(null);
+        needsScreenshot.add(true);
+      } else {
+        final images = await _embeddableImages(page);
+        embeddedImages.add(images);
+        needsScreenshot.add(images == null);
+      }
+    }
+
     final pool = Pool((Platform.numberOfProcessors ~/ 2).clamp(1, 4));
     final screenshots = await Future.wait(
       List.generate(pages.length, (pageIndex) {
-        final hasPdfBackground = pdfBackgrounds[pageIndex] != null;
-        if (hasPdfBackground && !_needsScreenshot(pages[pageIndex])) {
+        if (!needsScreenshot[pageIndex]) {
           return Future<im.Image?>.value(null);
         }
         return pool.withResource(
           () => _screenshot(
             coreInfo: coreInfo,
             pageIndex: pageIndex,
-            transparent: hasPdfBackground,
+            transparent: pdfBackgrounds[pageIndex] != null,
           ),
         );
       }),
@@ -107,43 +173,85 @@ abstract final class VectorPdfExporter {
       coreInfo.backgroundColor?.toARGB32() ??
           InnerCanvas.defaultBackgroundColor.toARGB32(),
     ).flatten();
+    final printPageIndicators = stows.printPageIndicators.value;
 
     final overlay = pw.Document();
     final specs = <PdfCompositePage>[];
     for (var i = 0; i < pages.length; i++) {
       final page = pages[i];
-      final pageSize = page.size;
+      final width = page.size.width;
+      final height = page.size.height;
       final screenshot = screenshots[i];
       final pdfBackground = pdfBackgrounds[i];
-      final hasVectorStrokes = page.strokes.any(
-        (stroke) => !EditorExporter.shouldRasterizeStroke(stroke),
-      );
+      final images = embeddedImages[i] ?? const [];
+      // A screenshot already contains the page number (drawn by the canvas).
+      final drawPageIndicator = printPageIndicators && screenshot == null;
 
       overlay.addPage(
         pw.Page(
-          pageFormat: PdfPageFormat(pageSize.width, pageSize.height),
+          pageFormat: PdfPageFormat(width, height),
           build: (pw.Context context) => pw.SizedBox(
-            width: pageSize.width,
-            height: pageSize.height,
-            child: pw.CustomPaint(
-              foregroundPainter: (PdfGraphics graphics, PdfPoint size) {
-                EditorExporter.drawVectorStrokes(
-                  graphics,
-                  strokes: page.strokes,
-                  pageHeight: pageSize.height,
-                  // Saber always shows PDF pages on white paper
-                  backgroundColor: pdfBackground != null
-                      ? PdfColors.white
-                      : defaultBackground,
-                );
-              },
-              child: screenshot == null
-                  ? pw.SizedBox(width: pageSize.width, height: pageSize.height)
-                  : pw.Image(
-                      pw.ImageImage(screenshot),
-                      width: pageSize.width,
-                      height: pageSize.height,
+            width: width,
+            height: height,
+            child: pw.Stack(
+              children: [
+                pw.CustomPaint(
+                  foregroundPainter: (PdfGraphics graphics, PdfPoint size) {
+                    // Same order as the canvas: highlighter underneath.
+                    EditorExporter.drawHighlighterStrokes(
+                      graphics,
+                      strokes: page.strokes,
+                      pageHeight: height,
+                    );
+                    EditorExporter.drawVectorStrokes(
+                      graphics,
+                      strokes: page.strokes,
+                      pageHeight: height,
+                      // Saber always shows PDF pages on white paper
+                      backgroundColor: pdfBackground != null
+                          ? PdfColors.white
+                          : defaultBackground,
+                    );
+                  },
+                  child: screenshot != null
+                      ? pw.Image(
+                          pw.ImageImage(screenshot),
+                          width: width,
+                          height: height,
+                        )
+                      : pw.Stack(
+                          children: [
+                            pw.SizedBox(width: width, height: height),
+                            for (final (image, pdfImage) in images)
+                              pw.Positioned(
+                                left: image.dstRect.left,
+                                top: image.dstRect.top,
+                                child: pw.Image(
+                                  pdfImage,
+                                  width: image.dstRect.width,
+                                  height: image.dstRect.height,
+                                  fit: pw.BoxFit.fill,
+                                ),
+                              ),
+                          ],
+                        ),
+                ),
+                if (drawPageIndicator)
+                  pw.Positioned(
+                    right: _pageIndicatorPadding,
+                    bottom: _pageIndicatorPadding,
+                    child: pw.Opacity(
+                      opacity: 0.5,
+                      child: pw.Text(
+                        '${i + 1} / ${pages.length}',
+                        style: const pw.TextStyle(
+                          fontSize: _pageIndicatorFontSize,
+                          color: PdfColors.black,
+                        ),
+                      ),
                     ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -151,8 +259,8 @@ abstract final class VectorPdfExporter {
 
       specs.add(
         PdfCompositePage(
-          width: pageSize.width,
-          height: pageSize.height,
+          width: width,
+          height: height,
           source: pdfBackground == null
               ? null
               : sourceIndices[pdfBackground.pdfFile?.path ??
@@ -160,7 +268,11 @@ abstract final class VectorPdfExporter {
                     pdfBackground],
           sourcePage: pdfBackground?.pdfPage ?? 0,
           hasOverlay:
-              pdfBackground == null || screenshot != null || hasVectorStrokes,
+              pdfBackground == null ||
+              screenshot != null ||
+              page.strokes.isNotEmpty ||
+              images.isNotEmpty ||
+              drawPageIndicator,
         ),
       );
     }
@@ -189,6 +301,8 @@ abstract final class VectorPdfExporter {
       coreInfo: coreInfo,
       pageIndex: pageIndex,
       transparentBackground: transparent,
+      // Highlighter and pen strokes are drawn as vectors on top.
+      strokeFilter: _isPencil,
     );
     try {
       // PDF soft masks expect straight (not premultiplied) alpha,
